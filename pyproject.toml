@@ -192,6 +192,9 @@ ignore = [
 "rllm/rewards/code_utils/**" = ["ALL"]
 # Prompt / string-heavy files where long lines are intentional
 "rllm/agents/system_prompts.py" = ["E501"]
+# Verbatim transcription of AA's published GDPval prompts; reflowing them would
+# defeat the point of the snapshot.
+"tests/data/test_gdpval_aa_spec.py" = ["E501"]
 "rllm/system_prompts.py" = ["E501"]
 "rllm/agents/code_agent.py" = ["E501"]
 "examples/archive/deepresearch/deepresearch_agent.py" = ["E501"]
@@ -213,7 +216,7 @@ where   = ["."]
 include = ["rllm", "rllm.*"]
 
 [tool.setuptools.package-data]
-rllm = ["trainer/**/config/**/*.yaml", "registry/*.json"]
+rllm = ["trainer/**/config/**/*.yaml", "registry/*.json", "data/gdpval_aa/*.txt"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]

@@ -83,3 +83,26 @@ def test_download_dir_rejects_filesystem_root(tmp_path):
 
     with pytest.raises(ValueError, match="other than the filesystem root"):
         sandbox.download_dir("/", str(tmp_path))
+
+
+def test_snapshot_capture_is_given_a_workable_timeout():
+    """modal's snapshot_filesystem() defaults to 55s.
+
+    That only ever fits a minimal image; a multi-GB one fails with a bare
+    "Timeout expired" that names neither the phase nor the bound. The capture
+    must be given an explicit budget, and the sandbox has to outlive it.
+    """
+    import inspect
+
+    import modal
+
+    from rllm.sandbox.backends import modal_backend
+
+    sdk_default = inspect.signature(modal.Sandbox.snapshot_filesystem).parameters["timeout"].default
+    assert sdk_default <= 60, "SDK default changed; revisit whether an override is still needed"
+
+    assert modal_backend._SNAPSHOT_TIMEOUT >= 600
+    source = inspect.getsource(modal_backend.build_modal_snapshot)
+    assert "snapshot_filesystem(timeout=_SNAPSHOT_TIMEOUT)" in source
+    # The sandbox is what is being captured, so its lifetime must cover it.
+    assert "_SNAPSHOT_TIMEOUT + 600" in source

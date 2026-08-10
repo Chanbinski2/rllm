@@ -1,9 +1,16 @@
-"""Materialize OpenAI GDPval as rLLM sandbox tasks.
+"""Materialize OpenAI GDPval as rLLM sandbox tasks, in AA-compatible form.
 
 The source dataset stores prompts plus Hugging Face paths for task inputs and
-expert deliverables.  This builder stages the inputs in the task environment,
-keeps expert files under ``tests/reference`` (uploaded only after the agent
-finishes), writes the GDPval solver image, and emits an LLM-judge verifier.
+expert deliverables.  This builder stages the inputs at deterministic absolute
+paths inside the solver environment, keeps expert deliverables under
+``tests/reference`` (uploaded only after the agent finishes), writes the
+GDPval-AA v2 compatible sandbox image, and renders Artificial Analysis'
+published solver prompt.
+
+This is the *solver-generation* stage only.  The verifier it emits performs
+structural submission validation and nothing else: no quality judgement, no
+comparison against expert deliverables, no pairwise ranking.  Those belong to a
+later evaluation stage that consumes the submission corpus this produces.
 """
 
 from __future__ import annotations
@@ -19,6 +26,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+from rllm.data import gdpval_aa
+
 logger = logging.getLogger(__name__)
 
 REPO_ID = "openai/gdpval"
@@ -29,6 +38,12 @@ _EXTERNAL_OPEN_REL = re.compile(
     re.IGNORECASE,
 )
 _SUSPICIOUS_SETTINGS = re.compile(rb"(?:xmlns:ns\d+\s*=|</?ns\d+:)")
+
+#: Where the harness stages and reports the solver's submission. The verifier
+#: reads these paths; keep them in sync with :mod:`rllm.harnesses.stirrup`.
+SUBMISSION_ROOT = "/tmp/gdpval-aa"
+SUBMISSION_DIR = f"{SUBMISSION_ROOT}/submission"
+RUN_METADATA_PATH = f"{SUBMISSION_ROOT}/run.json"
 
 
 def _toml_escape(value: str) -> str:
@@ -189,11 +204,12 @@ def _repair_office_file(path: Path, backup_path: Path) -> dict:
     return result
 
 
-def _basenames(row: dict, key: str) -> list[str]:
-    return [Path(str(value)).name for value in row.get(key) or []]
-
-
 def _download_files(paths: list[str], destination: Path) -> list[str]:
+    """Copy dataset files out of the HF cache into *destination*.
+
+    Repairs mutate the staged copy only — the cache stays pristine so a rebuild
+    always starts from the dataset as published.
+    """
     from huggingface_hub import hf_hub_download
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -217,43 +233,61 @@ def _repair_staged_files(paths: list[Path], *, task_id: str, role: str, backup_r
     return records
 
 
-def _write_instruction(task_dir: Path, row: dict, input_names: list[str]) -> None:
-    lines = [str(row.get("prompt") or "").strip(), ""]
-    if input_names:
-        lines.extend(["## Input files", "These files are available in the code-execution working directory:", *[f"- {name}" for name in input_names], ""])
-    expected = _basenames(row, "deliverable_files")
-    if expected:
-        lines.extend(["## Expected deliverable filename(s)", *[f"- {name}" for name in expected], ""])
-    lines.extend(
-        [
-            "## Submission",
-            "Create final deliverables in the code-execution working directory, then submit their relative paths with the finish tool.",
-            "",
-        ]
+def _dataset_revision() -> str:
+    try:
+        from huggingface_hub import dataset_info
+
+        return str(dataset_info(REPO_ID).sha or "")
+    except Exception:
+        logger.debug("[gdpval] could not resolve dataset revision", exc_info=True)
+        return ""
+
+
+def reference_file_paths(input_names: list[str]) -> list[str]:
+    """Absolute in-sandbox paths for staged reference files.
+
+    ``environment/files/`` is uploaded to the task's workdir, so a staged file
+    lands at ``<workdir>/<basename>``. The prompt must quote these exact paths.
+    """
+    return [f"{gdpval_aa.AA_WORKDIR}/{name}" for name in input_names]
+
+
+def _write_instruction(task_dir: Path, row: dict, input_names: list[str]) -> str:
+    """Write AA's published task prompt. Returns the rendered prompt."""
+    prompt = gdpval_aa.render_aa_gdpval_task_prompt(
+        task_description=str(row.get("prompt") or "").strip(),
+        reference_paths=reference_file_paths(input_names),
     )
-    (task_dir / "instruction.md").write_text("\n".join(lines), encoding="utf-8")
+    (task_dir / "instruction.md").write_text(prompt, encoding="utf-8")
+    return prompt
 
 
-def _write_task_toml(task_dir: Path, row: dict, input_names: list[str], gold_names: list[str]) -> None:
+def _write_task_toml(task_dir: Path, row: dict, input_names: list[str]) -> None:
+    """Write the harbor task config.
+
+    Expert deliverables are deliberately absent: they stay under ``tests/`` and
+    are only uploaded (root-owned, mode 700) once the solver has finished.
+    """
     lines = [
         'schema_version = "1.1"',
         f'task_id = "{row["task_id"]}"',
         f'sector = """{_toml_escape(str(row.get("sector") or ""))}"""',
         f'occupation = """{_toml_escape(str(row.get("occupation") or ""))}"""',
-        f"reference_files = {json.dumps(input_names)}",
-        f"reference_deliverables = {json.dumps(gold_names)}",
+        f"reference_files = {json.dumps(reference_file_paths(input_names))}",
         "",
         "[task]",
         f'name = "{row["task_id"]}"',
         "",
         "[environment]",
-        'workdir = "/home/user"',
+        f'workdir = "{gdpval_aa.AA_WORKDIR}"',
+        f'docker_image = "{gdpval_aa.AA_BASE_IMAGE}@{gdpval_aa.AA_BASE_IMAGE_DIGEST}"',
         "cpus = 4",
         "memory_mb = 16384",
         "storage_mb = 32768",
         "",
         "[agent]",
-        'user = "root"',
+        # AA runs the solver as the non-root user the task prompt names.
+        f'user = "{gdpval_aa.AA_AGENT_USER}"',
         "timeout_sec = 14400",
         "",
         "[verifier]",
@@ -261,26 +295,51 @@ def _write_task_toml(task_dir: Path, row: dict, input_names: list[str], gold_nam
         'user = "root"',
         "timeout_sec = 1800",
         "",
-        "[verifier.env]",
-        'GDPVAL_JUDGE_API_KEY = "${GDPVAL_JUDGE_API_KEY}"',
-        'GDPVAL_JUDGE_MODEL = "${GDPVAL_JUDGE_MODEL}"',
-        "",
     ]
     (task_dir / "task.toml").write_text("\n".join(lines), encoding="utf-8")
 
 
-def _write_tests(task_dir: Path, row: dict) -> None:
+def _write_provenance(
+    task_dir: Path,
+    row: dict,
+    *,
+    prompt: str,
+    input_names: list[str],
+    inputs_dir: Path,
+    dataset_revision: str,
+) -> None:
+    """Record everything a later grading stage needs to trust this run."""
+    reference_files = []
+    for name, path in zip(input_names, reference_file_paths(input_names), strict=True):
+        staged = inputs_dir / name
+        reference_files.append({"path": path, "sha256": _sha256(staged), "size_bytes": staged.stat().st_size})
+
+    provenance = {
+        "schema_version": 1,
+        "benchmark": "gdpval",
+        "methodology": "GDPval-AA v2",
+        "task_id": row["task_id"],
+        "sector": row.get("sector", ""),
+        "occupation": row.get("occupation", ""),
+        "dataset_repo": REPO_ID,
+        "dataset_revision": dataset_revision,
+        "sandbox_base_image": f"{gdpval_aa.AA_BASE_IMAGE}@{gdpval_aa.AA_BASE_IMAGE_DIGEST}",
+        "sandbox_image_digest": gdpval_aa.AA_BASE_IMAGE_DIGEST,
+        "sandbox_platform": gdpval_aa.AA_PLATFORM,
+        "debian_snapshot": gdpval_aa.AA_DEBIAN_SNAPSHOT,
+        "system_prompt_sha256": gdpval_aa.sha256_text(gdpval_aa.AA_GDPVAL_SYSTEM_PROMPT),
+        "task_prompt_sha256": gdpval_aa.sha256_text(prompt),
+        "reference_files": reference_files,
+    }
+    (task_dir / "gdpval_aa.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_tests(task_dir: Path) -> None:
     tests_dir = task_dir / "tests"
     tests_dir.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        "task_id": row["task_id"],
-        "prompt": row.get("prompt") or "",
-        "rubric": row.get("rubric_pretty") or row.get("rubric_json") or "",
-    }
-    (tests_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     (tests_dir / "evaluate.py").write_text(_VERIFIER_SOURCE, encoding="utf-8")
     test_sh = tests_dir / "test.sh"
-    test_sh.write_text("#!/bin/bash\nset -euo pipefail\npython /tests/evaluate.py\n", encoding="utf-8")
+    test_sh.write_text("#!/bin/bash\nset -euo pipefail\npython3 /tests/evaluate.py\n", encoding="utf-8")
     test_sh.chmod(0o755)
 
 
@@ -334,6 +393,8 @@ def build_benchmark(
     if limit is not None:
         rows = rows[:limit]
 
+    dockerfile_body = gdpval_aa.render_dockerfile()
+    dataset_revision = _dataset_revision()
     repair_records: list[dict] = []
     registry_rows: list[dict] = []
     backup_root = out / ".office-repair-originals"
@@ -349,22 +410,19 @@ def build_benchmark(
         input_names = _download_files(list(row.get("reference_files") or []), inputs_dir)
         gold_names = _download_files(list(row.get("deliverable_files") or []), gold_dir)
         if repair_office_files:
-            repair_records.extend(
-                _repair_staged_files([inputs_dir / name for name in input_names], task_id=task_id, role="input", backup_root=backup_root)
-            )
-            repair_records.extend(
-                _repair_staged_files([gold_dir / name for name in gold_names], task_id=task_id, role="expert", backup_root=backup_root)
-            )
+            repair_records.extend(_repair_staged_files([inputs_dir / name for name in input_names], task_id=task_id, role="input", backup_root=backup_root))
+            repair_records.extend(_repair_staged_files([gold_dir / name for name in gold_names], task_id=task_id, role="expert", backup_root=backup_root))
 
-        (task_dir / "environment" / "Dockerfile").write_text(_DOCKERFILE, encoding="utf-8")
-        _write_instruction(task_dir, row, input_names)
-        _write_task_toml(task_dir, row, input_names, gold_names)
-        _write_tests(task_dir, row)
+        (task_dir / "environment" / "Dockerfile").write_text(dockerfile_body, encoding="utf-8")
+        prompt = _write_instruction(task_dir, row, input_names)
+        _write_task_toml(task_dir, row, input_names)
+        _write_provenance(task_dir, row, prompt=prompt, input_names=input_names, inputs_dir=inputs_dir, dataset_revision=dataset_revision)
+        _write_tests(task_dir)
         registry_rows.append(
             {
                 "task_id": task_id,
                 "id": task_id,
-                "instruction": str(row.get("prompt") or ""),
+                "instruction": prompt,
                 "task_path": str(task_dir),
                 "occupation": row.get("occupation", ""),
                 "sector": row.get("sector", ""),
@@ -405,224 +463,115 @@ def build_benchmark(
     return out
 
 
-_DOCKERFILE = r'''FROM python:3.10-bookworm
+_VERIFIER_SOURCE = (
+    '''"""Structural validation of a GDPval-AA solver submission.
 
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libreoffice libreoffice-writer fonts-dejavu-core tesseract-ocr tesseract-ocr-eng \
-    pandoc poppler-utils ghostscript ffmpeg graphviz libgraphviz-dev openjdk-17-jre-headless \
-    gdal-bin libgdal-dev libgeos-dev libproj-dev gcc g++ cmake pkg-config make gfortran \
-    libsndfile1 libzbar0 libgl1-mesa-glx libglib2.0-0 libcairo2-dev libpango1.0-dev \
-    libgdk-pixbuf2.0-dev libffi-dev libxml2-dev libxslt1-dev wkhtmltopdf unrar-free \
-    espeak-ng texlive-latex-base texlive-latex-recommended texlive-latex-extra latexmk \
-    && rm -rf /var/lib/apt/lists/*
-RUN fc-cache -f
-RUN pip install --no-cache-dir --upgrade 'pip>=25.0' 'setuptools<81'
-ARG PIP_FLAGS="--no-cache-dir --prefer-binary --retries 10 --timeout 60"
-RUN pip install $PIP_FLAGS \
-    numpy 'pandas<2' scipy matplotlib 'Pillow<10' seaborn plotly bokeh numpy-financial \
-    sympy h5py tables statsmodels scikit-learn scikit-image xgboost lightgbm shap \
-    nltk gensim 'spacy<3.8' textblob opencv-python pytesseract qrcode pyzbar imgkit
-RUN pip install $PIP_FLAGS \
-    ffmpeg-python pydub 'moviepy<2' soundfile 'librosa>=0.10' mutagen \
-    'python-docx<1' 'python-pptx<1' openpyxl xlrd PyMuPDF pdf2image pdfplumber \
-    pypandoc docx2txt odfpy pyxlsb 'camelot-py[base]' fpdf2 'reportlab<4' weasyprint \
-    graphviz 'pydot<2' networkx svglib svgwrite cairosvg wordcloud \
-    shapely fiona geopandas geopy rasterio rdkit biopython
-RUN pip install $PIP_FLAGS \
-    markdownify anytree rarfile chardet tqdm tabulate faker loguru rapidfuzz \
-    pycountry cryptography pyopenssl requests pytest
-RUN pip install --no-cache-dir 'setuptools<81'
-RUN mkdir -p /home/user/deliverables
-WORKDIR /home/user
-CMD ["tail", "-f", "/dev/null"]
-'''
+This stage produces the submission corpus; it does not grade it. There is no
+judge model, no expert-deliverable comparison and no quality score here — a
+structurally valid submission means only that the solver terminated properly
+and that its files were preserved, not that the work is any good.
 
+Every run is therefore reported as ungraded.
+"""
 
-_VERIFIER_SOURCE = r'''from __future__ import annotations
+from __future__ import annotations
 
-import base64
 import json
-import mimetypes
-import os
-import random
-import re
-import subprocess
-import tempfile
-import urllib.request
 from pathlib import Path
 
-import fitz
-
-CANDIDATE_DIR = Path("/home/user/deliverables")
-REFERENCE_DIR = Path("/tests/reference")
+SUBMISSION_DIR = Path("'''
+    + SUBMISSION_DIR
+    + '''")
+RUN_PATH = Path("'''
+    + RUN_METADATA_PATH
+    + '''")
+MANIFEST_PATH = SUBMISSION_DIR / "manifest.json"
 REWARD_PATH = Path("/logs/verifier/reward.json")
-MEDIA_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".mov", ".avi", ".webm"}
 
 
-def extract_text(path: Path) -> str:
-    suffix = path.suffix.lower()
-    try:
-        if suffix in {".txt", ".md", ".csv", ".json", ".py", ".html", ".xml"}:
-            return path.read_text(encoding="utf-8", errors="replace")
-        if suffix == ".pdf":
-            with fitz.open(path) as document:
-                return "\n".join(page.get_text() for page in document)
-        if suffix in {".docx", ".doc"}:
-            from docx import Document
-
-            document = Document(path)
-            return "\n".join([*(p.text for p in document.paragraphs), *(" | ".join(c.text for c in row.cells) for table in document.tables for row in table.rows)])
-        if suffix in {".xlsx", ".xlsm"}:
-            import openpyxl
-
-            workbook = openpyxl.load_workbook(path, data_only=False, read_only=True)
-            parts = []
-            for sheet in workbook.worksheets:
-                parts.append(f"## Sheet: {sheet.title}")
-                parts.extend(" | ".join("" if value is None else str(value) for value in row) for row in sheet.iter_rows(values_only=True))
-            return "\n".join(parts)
-        if suffix == ".pptx":
-            from pptx import Presentation
-
-            deck = Presentation(path)
-            return "\n".join(shape.text for slide in deck.slides for shape in slide.shapes if hasattr(shape, "text"))
-        return f"[{path.name}: binary file, {path.stat().st_size} bytes]"
-    except Exception as exc:
-        return f"[{path.name}: extraction failed: {exc}]"
-
-
-def render_images(path: Path, max_pages: int = 8) -> list[str]:
-    suffix = path.suffix.lower()
-    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        return [f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"]
-    pdf_path = path
-    temporary = None
-    if suffix in {".docx", ".xlsx", ".xlsm", ".pptx"}:
-        temporary = tempfile.TemporaryDirectory()
-        subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", temporary.name, str(path)],
-            check=False,
-            capture_output=True,
-            timeout=180,
-        )
-        pdf_path = Path(temporary.name) / f"{path.stem}.pdf"
-    if pdf_path.suffix.lower() != ".pdf" or not pdf_path.exists():
-        if temporary:
-            temporary.cleanup()
-        return []
-    images = []
-    try:
-        with fitz.open(pdf_path) as document:
-            for page in list(document)[:max_pages]:
-                data = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png")
-                images.append(f"data:image/png;base64,{base64.b64encode(data).decode()}")
-    finally:
-        if temporary:
-            temporary.cleanup()
-    return images
-
-
-def describe(label: str, paths: list[Path]) -> tuple[str, list[str]]:
-    text = [f"## {label}"]
-    images = []
-    for path in paths:
-        text.extend([f"\n### File: {path.name}", extract_text(path)[:120000]])
-        images.extend(render_images(path))
-    return "\n".join(text), images[:16]
-
-
-def judge(metadata: dict, candidate: list[Path], reference: list[Path]) -> tuple[float, dict]:
-    candidate_text, candidate_images = describe("Submission A", candidate)
-    reference_text, reference_images = describe("Submission B", reference)
-    seed = int.from_bytes(metadata["task_id"].encode(), "little")
-    swapped = bool(random.Random(seed).getrandbits(1))
-    if swapped:
-        candidate_text, reference_text = reference_text, candidate_text
-        candidate_images, reference_images = reference_images, candidate_images
-
-    content = [
-        {
-            "type": "text",
-            "text": (
-                "You are an impartial evaluator. Compare two submissions for the task and rubric below. "
-                "Judge correctness, completeness, usability, and visual quality. Return only JSON: "
-                '{"winner":"A"}, {"winner":"B"}, or {"winner":"tie"}.\n\n'
-                f"TASK:\n{metadata['prompt']}\n\nRUBRIC:\n{metadata['rubric']}\n\n{candidate_text}"
-            ),
-        }
-    ]
-    content.extend({"type": "image_url", "image_url": {"url": image}} for image in candidate_images)
-    content.append({"type": "text", "text": reference_text})
-    content.extend({"type": "image_url", "image_url": {"url": image}} for image in reference_images)
-    base_url = os.environ.get("GDPVAL_JUDGE_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-    judge_model = os.environ["GDPVAL_JUDGE_MODEL"]
-    if "openrouter.ai" in base_url and judge_model.startswith("openrouter/"):
-        judge_model = judge_model.removeprefix("openrouter/")
-    payload = {
-        "model": judge_model,
-        "messages": [{"role": "user", "content": content}],
-        "temperature": 0,
-        "max_tokens": 2048,
-    }
-    request = urllib.request.Request(
-        base_url + "/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {os.environ['GDPVAL_JUDGE_API_KEY']}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=600) as response:
-        body = json.loads(response.read())
-    answer = body["choices"][0]["message"]["content"]
-    match = re.search(r'"winner"\s*:\s*"(A|B|tie)"', answer, re.IGNORECASE)
-    if not match:
-        raise ValueError(f"judge returned no winner: {answer[:500]}")
-    winner = match.group(1).lower()
-    if swapped:
-        score = {"a": 0.0, "b": 1.0, "tie": 0.5}[winner]
-    else:
-        score = {"a": 1.0, "b": 0.0, "tie": 0.5}[winner]
-    return score, {"winner": winner, "positions_swapped": swapped, "judge_model": payload["model"]}
-
-
-def write_reward(reward: float, *, ungraded: bool = False, metadata: dict | None = None, signals: dict | None = None) -> None:
-    all_signals = {"pairwise_win": reward, "ungraded": 1.0 if ungraded else 0.0}
-    all_signals.update(signals or {})
+def write_reward(signals: dict, metadata: dict) -> None:
+    """Emit an always-ungraded reward carrying structural signals only."""
     REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
     REWARD_PATH.write_text(
         json.dumps(
             {
-                "reward": reward,
-                "is_correct": reward > 0.5,
-                "signals": all_signals,
-                "metadata": metadata or {},
+                "reward": 0.0,
+                "is_correct": False,
+                "signals": {"ungraded": 1.0, **signals},
+                "metadata": {
+                    "stage": "solver_generation",
+                    "graded": False,
+                    "note": "Structural submission validation only; output quality is not judged at this stage.",
+                    **metadata,
+                },
             }
         )
     )
 
 
-def main() -> None:
-    metadata = json.loads(Path("/tests/metadata.json").read_text())
-    candidate = sorted(path for path in CANDIDATE_DIR.rglob("*") if path.is_file()) if CANDIDATE_DIR.exists() else []
-    reference = sorted(path for path in REFERENCE_DIR.rglob("*") if path.is_file()) if REFERENCE_DIR.exists() else []
-    if not candidate:
-        write_reward(0.0, metadata={"reason": "no_deliverable"}, signals={"deliverable_present": 0.0})
-        return
-    if not reference:
-        write_reward(0.0, ungraded=True, metadata={"reason": "no_expert_reference"}, signals={"deliverable_present": 1.0, "expert_reference_present": 0.0})
-        return
-    if all(path.suffix.lower() in MEDIA_EXTENSIONS for path in [*candidate, *reference]):
-        write_reward(0.0, ungraded=True, metadata={"reason": "media_requires_files_api"}, signals={"deliverable_present": 1.0, "expert_reference_present": 1.0})
-        return
+def load_json(path: Path) -> dict | None:
     try:
-        score, decision = judge(metadata, candidate, reference)
-    except Exception as exc:
-        write_reward(0.0, ungraded=True, metadata={"reason": "judge_failed", "error": str(exc)}, signals={"deliverable_present": 1.0, "expert_reference_present": 1.0})
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def main() -> None:
+    signals = {"finish_called": 0.0, "abandoned": 0.0, "submission_valid": 0.0, "artifact_count": 0.0}
+
+    run = load_json(RUN_PATH)
+    if run is None:
+        write_reward(signals, {"reason": "no_run_metadata"})
         return
-    write_reward(score, metadata=decision, signals={"deliverable_present": 1.0, "expert_reference_present": 1.0})
+
+    termination = run.get("termination") or {}
+    kind = termination.get("type")
+    if kind == "abandon_task_finish":
+        signals["abandoned"] = 1.0
+        write_reward(signals, {"reason": "abandoned", "abandon_reason": termination.get("reason", "")})
+        return
+    if kind != "finish":
+        write_reward(signals, {"reason": "no_finish_tool_call", "termination": kind})
+        return
+
+    signals["finish_called"] = 1.0
+
+    manifest = load_json(MANIFEST_PATH)
+    if manifest is None:
+        write_reward(signals, {"reason": "no_submission_manifest"})
+        return
+
+    artifacts = manifest.get("artifacts") or []
+    signals["artifact_count"] = float(len(artifacts))
+
+    rejected = manifest.get("rejected_paths") or []
+    submitted = termination.get("submitted_paths") or []
+    if not submitted:
+        write_reward(signals, {"reason": "finish_without_files"})
+        return
+
+    missing_bundle = [
+        entry.get("submitted_path")
+        for entry in artifacts
+        if not (SUBMISSION_DIR / str(entry.get("bundle_path") or "")).is_file()
+    ]
+    if missing_bundle:
+        write_reward(signals, {"reason": "artifacts_not_preserved", "missing": missing_bundle})
+        return
+
+    if len(artifacts) != len(submitted) or rejected:
+        write_reward(
+            signals,
+            {"reason": "invalid_submitted_paths", "submitted": len(submitted), "preserved": len(artifacts), "rejected": rejected},
+        )
+        return
+
+    signals["submission_valid"] = 1.0
+    write_reward(signals, {"reason": "submission_structurally_valid"})
 
 
 if __name__ == "__main__":
     main()
 '''
+)
