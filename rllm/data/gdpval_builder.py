@@ -3,14 +3,13 @@
 The source dataset stores prompts plus Hugging Face paths for task inputs and
 expert deliverables.  This builder stages the inputs at deterministic absolute
 paths inside the solver environment, keeps expert deliverables under
-``tests/reference`` (uploaded only after the agent finishes), writes the
-GDPval-AA v2 compatible sandbox image, and renders Artificial Analysis'
-published solver prompt.
+``tests/reference`` on the host, writes the GDPval-AA v2 compatible sandbox
+image, and renders Artificial Analysis' published solver prompt.
 
-This is the *solver-generation* stage only.  The verifier it emits performs
-structural submission validation and nothing else: no quality judgement, no
-comparison against expert deliverables, no pairwise ranking.  Those belong to a
-later evaluation stage that consumes the submission corpus this produces.
+Grading is a single host-side stage: ``dataset.toml`` declares the multimodal
+weighted-rubric ``reward_fn``, which runs after the solver exits. Tasks carry no
+verifier of their own, so neither the rubric nor the expert deliverables ever
+enter the sandbox.
 """
 
 from __future__ import annotations
@@ -31,6 +30,12 @@ from rllm.data import gdpval_aa
 logger = logging.getLogger(__name__)
 
 REPO_ID = "openai/gdpval"
+
+#: Grader written into the generated ``dataset.toml`` when the caller supplies
+#: no catalog entry. Must stay equal to ``datasets.json``'s ``reward_fn`` for
+#: ``gdpval`` — :func:`_write_dataset_toml` explains why.
+DEFAULT_REWARD_FN = "gdpval_rubric_reward_fn"
+
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
 _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _EXTERNAL_OPEN_REL = re.compile(
@@ -39,8 +44,8 @@ _EXTERNAL_OPEN_REL = re.compile(
 )
 _SUSPICIOUS_SETTINGS = re.compile(rb"(?:xmlns:ns\d+\s*=|</?ns\d+:)")
 
-#: Where the harness stages and reports the solver's submission. The verifier
-#: reads these paths; keep them in sync with :mod:`rllm.harnesses.stirrup`.
+#: Where the harness stages and reports the solver's submission; keep them in
+#: sync with :mod:`rllm.harnesses.stirrup`, which writes and then collects them.
 SUBMISSION_ROOT = "/tmp/gdpval-aa"
 SUBMISSION_DIR = f"{SUBMISSION_ROOT}/submission"
 RUN_METADATA_PATH = f"{SUBMISSION_ROOT}/run.json"
@@ -262,11 +267,46 @@ def _write_instruction(task_dir: Path, row: dict, input_names: list[str]) -> str
     return prompt
 
 
+def _image_lines() -> list[str]:
+    """The ``[environment]`` image declaration, in pull or build mode.
+
+    **Pull** (a published image is pinned): the image *is* the environment, so
+    ``replay_dockerfile = false`` — every backend boots it as-is. This is how the
+    rest of rLLM's benchmarks work, and it is the mode that makes GDPval usable
+    at scale: no per-environment build, and every run provably uses the same
+    closure by digest.
+
+    **Build** (nothing published): the declared image is only the Dockerfile's
+    base, so replay must stay on. Declaring an image otherwise defaults replay
+    *off* — the Harbor convention, where a declared image is already built —
+    which leaves non-docker backends booting bare Debian with no solver user, no
+    packages and no venv, while the snapshot still reports success.
+    """
+    published = gdpval_aa.published_image_ref()
+    if published:
+        return [
+            f'docker_image = "{published}"',
+            "# The published image is the whole environment; nothing to replay.",
+            "replay_dockerfile = false",
+        ]
+    return [
+        f'docker_image = "{gdpval_aa.AA_BASE_IMAGE}@{gdpval_aa.AA_BASE_IMAGE_DIGEST}"',
+        "# Base image only — the AA closure is the Dockerfile's RUN steps.",
+        "replay_dockerfile = true",
+    ]
+
+
 def _write_task_toml(task_dir: Path, row: dict, input_names: list[str]) -> None:
     """Write the harbor task config.
 
-    Expert deliverables are deliberately absent: they stay under ``tests/`` and
-    are only uploaded (root-owned, mode 700) once the solver has finished.
+    No ``[verifier]`` block: grading is the dataset-level ``reward_fn``
+    :func:`_write_dataset_toml` declares, which runs on the host after the
+    sandbox is gone. A per-task verifier here would be a second grader that
+    disagrees with the first, and whichever one the CLI happened to resolve
+    would decide the score.
+
+    Expert deliverables are deliberately absent: they stay under ``tests/`` on
+    the host and are never uploaded, since nothing in the sandbox reads them.
     """
     lines = [
         'schema_version = "1.1"',
@@ -274,13 +314,26 @@ def _write_task_toml(task_dir: Path, row: dict, input_names: list[str]) -> None:
         f'sector = """{_toml_escape(str(row.get("sector") or ""))}"""',
         f'occupation = """{_toml_escape(str(row.get("occupation") or ""))}"""',
         f"reference_files = {json.dumps(reference_file_paths(input_names))}",
+        # The loader lifts these into ``task.metadata``, where the opt-in
+        # The ``gdpval`` reward_fn reads them: the raw work request (the AA
+        # instruction wraps it in submission boilerplate the judge should not
+        # weigh) and GDPval's weighted pass/fail criteria.
+        #
+        # ``task.toml`` is never uploaded to the sandbox — only
+        # ``environment/files/`` is — so the rubric, which states the expected
+        # answers, stays out of the solver's reach. It is deliberately NOT
+        # written to ``tests/rubric.json`` the way the cookbook does for its
+        # in-sandbox grader: ``tests/`` *is* uploaded, and a host-side grader
+        # has no use for a copy in there.
+        f'prompt = """{_toml_escape(str(row.get("prompt") or ""))}"""',
+        f'rubric_json = """{_toml_escape(str(row.get("rubric_json") or "[]"))}"""',
         "",
         "[task]",
         f'name = "{row["task_id"]}"',
         "",
         "[environment]",
         f'workdir = "{gdpval_aa.AA_WORKDIR}"',
-        f'docker_image = "{gdpval_aa.AA_BASE_IMAGE}@{gdpval_aa.AA_BASE_IMAGE_DIGEST}"',
+        *_image_lines(),
         "cpus = 4",
         "memory_mb = 16384",
         "storage_mb = 32768",
@@ -289,11 +342,6 @@ def _write_task_toml(task_dir: Path, row: dict, input_names: list[str]) -> None:
         # AA runs the solver as the non-root user the task prompt names.
         f'user = "{gdpval_aa.AA_AGENT_USER}"',
         "timeout_sec = 14400",
-        "",
-        "[verifier]",
-        'script = "tests/test.sh"',
-        'user = "root"',
-        "timeout_sec = 1800",
         "",
     ]
     (task_dir / "task.toml").write_text("\n".join(lines), encoding="utf-8")
@@ -334,16 +382,15 @@ def _write_provenance(
     (task_dir / "gdpval_aa.json").write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _write_tests(task_dir: Path) -> None:
-    tests_dir = task_dir / "tests"
-    tests_dir.mkdir(parents=True, exist_ok=True)
-    (tests_dir / "evaluate.py").write_text(_VERIFIER_SOURCE, encoding="utf-8")
-    test_sh = tests_dir / "test.sh"
-    test_sh.write_text("#!/bin/bash\nset -euo pipefail\npython3 /tests/evaluate.py\n", encoding="utf-8")
-    test_sh.chmod(0o755)
+def _write_dataset_toml(out: Path, *, name: str, split: str, description: str, default_agent: str, reward_fn: str) -> None:
+    """Write ``dataset.toml``, including the shared ``[verifier]``.
 
-
-def _write_dataset_toml(out: Path, *, name: str, split: str, description: str, default_agent: str) -> None:
+    The ``[verifier] name`` must match the catalog's ``reward_fn``. The eval CLI
+    resolves a benchmark two ways — from the catalog by name, or from this file
+    once the directory exists on disk — and both must land on the same grader.
+    Leaving it out is what makes a run silently fall through to whatever
+    per-task verifier it can find.
+    """
     (out / "dataset.toml").write_text(
         "\n".join(
             [
@@ -354,6 +401,9 @@ def _write_dataset_toml(out: Path, *, name: str, split: str, description: str, d
                 'default_sandbox = "docker"',
                 f'default_agent = "{default_agent}"',
                 f'split = "{split}"',
+                "",
+                "[verifier]",
+                f'name = "{reward_fn}"',
                 "",
             ]
         ),
@@ -393,7 +443,9 @@ def build_benchmark(
     if limit is not None:
         rows = rows[:limit]
 
-    dockerfile_body = gdpval_aa.render_dockerfile()
+    # Pull mode ships a three-line wrapper over the published image; build
+    # mode ships the full recipe so the closure can be constructed locally.
+    dockerfile_body = gdpval_aa.render_task_dockerfile() if gdpval_aa.published_image_ref() else gdpval_aa.render_dockerfile()
     dataset_revision = _dataset_revision()
     repair_records: list[dict] = []
     registry_rows: list[dict] = []
@@ -417,7 +469,6 @@ def build_benchmark(
         prompt = _write_instruction(task_dir, row, input_names)
         _write_task_toml(task_dir, row, input_names)
         _write_provenance(task_dir, row, prompt=prompt, input_names=input_names, inputs_dir=inputs_dir, dataset_revision=dataset_revision)
-        _write_tests(task_dir)
         registry_rows.append(
             {
                 "task_id": task_id,
@@ -433,7 +484,8 @@ def build_benchmark(
         raise RuntimeError(f"no GDPval tasks materialized from {REPO_ID} split={split}")
 
     description = (catalog_entry or {}).get("description") or "GDPval: 220 economically valuable knowledge-work tasks with expert deliverables."
-    _write_dataset_toml(out, name=name, split=split, description=description, default_agent=default_agent)
+    reward_fn = (catalog_entry or {}).get("reward_fn") or DEFAULT_REWARD_FN
+    _write_dataset_toml(out, name=name, split=split, description=description, default_agent=default_agent, reward_fn=reward_fn)
     if repair_office_files:
         statuses: dict[str, int] = {}
         for record in repair_records:
@@ -461,117 +513,3 @@ def build_benchmark(
         except Exception:
             logger.warning("[gdpval] could not register rows in DatasetRegistry", exc_info=True)
     return out
-
-
-_VERIFIER_SOURCE = (
-    '''"""Structural validation of a GDPval-AA solver submission.
-
-This stage produces the submission corpus; it does not grade it. There is no
-judge model, no expert-deliverable comparison and no quality score here — a
-structurally valid submission means only that the solver terminated properly
-and that its files were preserved, not that the work is any good.
-
-Every run is therefore reported as ungraded.
-"""
-
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-SUBMISSION_DIR = Path("'''
-    + SUBMISSION_DIR
-    + '''")
-RUN_PATH = Path("'''
-    + RUN_METADATA_PATH
-    + '''")
-MANIFEST_PATH = SUBMISSION_DIR / "manifest.json"
-REWARD_PATH = Path("/logs/verifier/reward.json")
-
-
-def write_reward(signals: dict, metadata: dict) -> None:
-    """Emit an always-ungraded reward carrying structural signals only."""
-    REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REWARD_PATH.write_text(
-        json.dumps(
-            {
-                "reward": 0.0,
-                "is_correct": False,
-                "signals": {"ungraded": 1.0, **signals},
-                "metadata": {
-                    "stage": "solver_generation",
-                    "graded": False,
-                    "note": "Structural submission validation only; output quality is not judged at this stage.",
-                    **metadata,
-                },
-            }
-        )
-    )
-
-
-def load_json(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def main() -> None:
-    signals = {"finish_called": 0.0, "abandoned": 0.0, "submission_valid": 0.0, "artifact_count": 0.0}
-
-    run = load_json(RUN_PATH)
-    if run is None:
-        write_reward(signals, {"reason": "no_run_metadata"})
-        return
-
-    termination = run.get("termination") or {}
-    kind = termination.get("type")
-    if kind == "abandon_task_finish":
-        signals["abandoned"] = 1.0
-        write_reward(signals, {"reason": "abandoned", "abandon_reason": termination.get("reason", "")})
-        return
-    if kind != "finish":
-        write_reward(signals, {"reason": "no_finish_tool_call", "termination": kind})
-        return
-
-    signals["finish_called"] = 1.0
-
-    manifest = load_json(MANIFEST_PATH)
-    if manifest is None:
-        write_reward(signals, {"reason": "no_submission_manifest"})
-        return
-
-    artifacts = manifest.get("artifacts") or []
-    signals["artifact_count"] = float(len(artifacts))
-
-    rejected = manifest.get("rejected_paths") or []
-    submitted = termination.get("submitted_paths") or []
-    if not submitted:
-        write_reward(signals, {"reason": "finish_without_files"})
-        return
-
-    missing_bundle = [
-        entry.get("submitted_path")
-        for entry in artifacts
-        if not (SUBMISSION_DIR / str(entry.get("bundle_path") or "")).is_file()
-    ]
-    if missing_bundle:
-        write_reward(signals, {"reason": "artifacts_not_preserved", "missing": missing_bundle})
-        return
-
-    if len(artifacts) != len(submitted) or rejected:
-        write_reward(
-            signals,
-            {"reason": "invalid_submitted_paths", "submitted": len(submitted), "preserved": len(artifacts), "rejected": rejected},
-        )
-        return
-
-    signals["submission_valid"] = 1.0
-    write_reward(signals, {"reason": "submission_structurally_valid"})
-
-
-if __name__ == "__main__":
-    main()
-'''
-)

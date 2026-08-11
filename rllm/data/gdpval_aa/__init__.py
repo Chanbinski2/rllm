@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import shlex
 from functools import lru_cache
 from importlib.resources import files
@@ -75,6 +76,63 @@ AA_VENV_DIR = "/opt/aa-venv"
 #: ``pip`` and ``wheel`` bootstrap a virtualenv and are not part of AA's
 #: published freeze. Everything else must match exactly.
 AA_PIP_BOOTSTRAP_PACKAGES = frozenset({"pip", "wheel"})
+
+
+#: Published sandbox image. Tasks reference this instead of rebuilding the
+#: closure, which is how every other rLLM benchmark works: the heavy image is
+#: prebuilt and pulled, and the task's Dockerfile is a thin wrapper.
+#:
+#: The tag is for humans; the digest is the pin. Tags move on re-push, so a task
+#: that referenced only ``:aa-v2`` would silently change environment without any
+#: change in the repo. ``RLLM_GDPVAL_IMAGE`` overrides both, for a private
+#: mirror or a locally built image.
+AA_PUBLISHED_IMAGE = "ghcr.io/rllm-org/gdpval-aa-compat:aa-v2"
+AA_PUBLISHED_IMAGE_DIGEST = "sha256:44a31f31f416bfe0292b8ce07181a04d4aec3942c8ff5366148bee34a5237a75"
+
+
+def published_image_ref() -> str | None:
+    """Pinned reference for the published sandbox image, or ``None``.
+
+    ``None`` means no published image is available, so the task must build the
+    closure from :func:`render_dockerfile` instead.
+    """
+    override = os.environ.get("RLLM_GDPVAL_IMAGE")
+    if override:
+        return override
+    if not AA_PUBLISHED_IMAGE_DIGEST:
+        return None
+    return f"{AA_PUBLISHED_IMAGE}@{AA_PUBLISHED_IMAGE_DIGEST}"
+
+
+def render_task_dockerfile() -> str:
+    """Thin wrapper over the published image, for a task's ``environment/``.
+
+    Mirrors what swebench_pro and friends emit: ``FROM`` a prebuilt image plus a
+    workdir, no ``RUN`` steps. :func:`render_dockerfile` remains the recipe the
+    published image is *built* from, with its manifest check as the release gate.
+    """
+    ref = published_image_ref()
+    if ref is None:
+        raise RuntimeError("no published GDPval image is pinned; set AA_PUBLISHED_IMAGE_DIGEST or RLLM_GDPVAL_IMAGE")
+    return "\n".join(
+        [
+            "# GDPval-AA v2 compatible sandbox — pulled, not built.",
+            "#",
+            "# The environment is the published image below; see",
+            "# rllm.data.gdpval_aa.render_dockerfile for the recipe it was built",
+            "# from, which verifies the closure against AA's published manifests.",
+            "#",
+            # The published manifest is an amd64-only index, and AA's closure has
+            # no arm64 equivalent (aspose-words and cadquery-ocp ship x86_64
+            # wheels only). Without --platform, Docker on an arm64 host resolves
+            # the index against its own arch and fails with "no match for
+            # platform in manifest" instead of emulating.
+            f"FROM --platform={AA_PLATFORM} {ref}",
+            f"WORKDIR {AA_WORKDIR}",
+            'CMD ["sleep", "infinity"]',
+            "",
+        ]
+    )
 
 
 def _read(name: str) -> str:
@@ -208,7 +266,6 @@ _APT_CONF = "\n".join(
     ]
 )
 
-_VENV_PROFILE = f'export PATH="{AA_VENV_DIR}/bin:$PATH"\nexport VIRTUAL_ENV="{AA_VENV_DIR}"\n'
 
 
 def apt_sources_list() -> str:
@@ -258,7 +315,13 @@ def dockerfile_run_commands() -> list[str]:
             f"dpkg-query -W -f='${{Package}}\\n' | sort > {_PACKAGES_BEFORE_PATH}"
             f" && apt-get update && apt-get install -y --no-install-recommends {_BUILD_PACKAGES}"
         ),
-        f"uv venv --seed --python {AA_PYTHON_VERSION} {AA_VENV_DIR} && VIRTUAL_ENV={AA_VENV_DIR} uv pip install --requirement {_PYTHON_MANIFEST_PATH}",
+        # UV_NO_CACHE keeps ~5.5GB of downloaded wheels out of the image — a
+        # third of its size, paid on every pull. It has to be avoided *here*
+        # rather than deleted later: layers are additive, so an `rm` in a
+        # subsequent RUN would leave the bytes in this one.
+        f"UV_NO_CACHE=1 uv venv --seed --python {AA_PYTHON_VERSION} {AA_VENV_DIR}"
+        f" && UV_NO_CACHE=1 VIRTUAL_ENV={AA_VENV_DIR} uv pip install --requirement {_PYTHON_MANIFEST_PATH}"
+        " && rm -rf /root/.cache/uv",
         # Purge precisely the delta, not a hand-written list: --auto-remove
         # alone would be free to take packages the manifest requires.
         (
@@ -267,15 +330,12 @@ def dockerfile_run_commands() -> list[str]:
             f" && apt-get purge -y $(cat {_BUILD_ONLY_PACKAGES_PATH})"
             " && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*"
         ),
-        # ENV is not replayed by non-docker backends, so put the solver's
-        # interpreter on PATH in ways that survive a plain `sh -c`.
-        (
-            f"ln -sf {AA_VENV_DIR}/bin/python /usr/local/bin/python"
-            f" && ln -sf {AA_VENV_DIR}/bin/python /usr/local/bin/python3"
-            f" && ln -sf {AA_VENV_DIR}/bin/pip /usr/local/bin/pip"
-            f" && {_write_file_command('/etc/profile.d/10-gdpval-aa.sh', _VENV_PROFILE)}"
-        ),
         f"PLAYWRIGHT_BROWSERS_PATH=/opt/playwright {AA_VENV_DIR}/bin/playwright install chromium",
+        # `ENV PATH` covers non-login shells and `su ... -c`, which is every
+        # path the harness and code-exec provider use. A *login* shell is the
+        # exception: /etc/profile resets PATH, so a model running `bash -lc`
+        # would silently get Debian's python without AA's 419 packages.
+        _write_file_command("/etc/profile.d/10-gdpval-aa.sh", f'export PATH="{AA_VENV_DIR}/bin:$PATH"\nexport VIRTUAL_ENV="{AA_VENV_DIR}"\n'),
         (
             f"(getent group {AA_AGENT_GID} || groupadd --gid {AA_AGENT_GID} {AA_AGENT_USER})"
             f" && (getent passwd {AA_AGENT_UID} || useradd --uid {AA_AGENT_UID} --gid {AA_AGENT_GID} --create-home --shell /bin/bash {AA_AGENT_USER})"
@@ -305,6 +365,18 @@ def render_dockerfile() -> str:
         "# x86_64-only wheels with no sdist, and 11 pinned Debian packages have no",
         "# arm64 build, so no other architecture can satisfy the manifest.",
         f"FROM --platform={AA_PLATFORM} {AA_BASE_IMAGE}@{AA_BASE_IMAGE_DIGEST}",
+        "",
+        # AA publishes no image and no build recipe — only the package closure.
+        # Say so on the artifact, so a published copy cannot be mistaken for an
+        # Artificial Analysis release.
+        'LABEL org.opencontainers.image.title="GDPval-AA v2 compatible sandbox (unofficial reproduction)"',
+        'LABEL org.opencontainers.image.description="Independent reproduction of the package closure Artificial Analysis publishes for GDPval-AA v2. AA publishes no image and no build recipe: only the pinned Python and Debian versions. The build steps here are rLLM\'s own, verified against those manifests at build time. Not an Artificial Analysis artifact."',
+        'LABEL org.opencontainers.image.source="https://github.com/rllm-org/rllm"',
+        'LABEL ai.artificialanalysis.methodology="GDPval-AA v2"',
+        'LABEL ai.artificialanalysis.methodology-url="https://artificialanalysis.ai/methodology/intelligence-benchmarking#gdpval-aa"',
+        f'LABEL org.rllm.gdpval.debian-packages="{len(system_package_pins())}"',
+        f'LABEL org.rllm.gdpval.python-packages="{len(python_package_pins())}"',
+        f'LABEL org.rllm.gdpval.debian-snapshot="{AA_DEBIAN_SNAPSHOT}"',
         "",
         "ENV DEBIAN_FRONTEND=noninteractive",
         "ENV LANG=C.UTF-8",
