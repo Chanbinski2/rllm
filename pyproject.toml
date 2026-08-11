@@ -56,6 +56,18 @@ rewards = [
     "antlr4-python3-runtime==4.9.3",
 ]
 
+# Host-side document parsing for the ``gdpval`` grader. Without these the
+# judge receives an extraction-error marker instead of the deliverable and
+# returns a confident low score, so the grader refuses to run without them.
+gdpval = [
+    "openpyxl>=3.1",     # .xlsx
+    "python-docx>=1.0",  # .docx
+    "python-pptx>=1.0",  # .pptx
+    "pdfplumber>=0.11",  # .pdf text
+    "pymupdf>=1.26",     # pdf -> page images
+    "pillow>=10.0",
+]
+
 tools = [
     "mcp",
 ]
@@ -94,7 +106,10 @@ tinker = [
 ]
 
 fireworks = [
-    "fireworks-ai[training]==1.2.1 ; python_version >= '3.11'",
+    # fireworks-training-cookbook (a git dep, so it moves) now requires
+    # >=1.2.6, which the old ``==1.2.1`` pin cannot satisfy — the extra is
+    # uninstallable without this. Unrelated to GDPval; just unavoidable here.
+    "fireworks-ai[training]>=1.2.6,<2 ; python_version >= '3.11'",
     "fireworks-training-cookbook @ git+https://github.com/fw-ai/cookbook.git#subdirectory=training ; python_version >= '3.11'",
 ]
 
@@ -195,6 +210,8 @@ ignore = [
 # Verbatim transcription of AA's published GDPval prompts; reflowing them would
 # defeat the point of the snapshot.
 "tests/data/test_gdpval_aa_spec.py" = ["E501"]
+# Long OCI LABEL text is a single unbreakable string.
+"rllm/data/gdpval_aa/__init__.py" = ["E501"]
 "rllm/system_prompts.py" = ["E501"]
 "rllm/agents/code_agent.py" = ["E501"]
 "examples/archive/deepresearch/deepresearch_agent.py" = ["E501"]

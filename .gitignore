@@ -226,3 +226,12 @@ gcp-key.json
 
 # IDE
 .vscode/
+
+# GDPval smoke/canary run outputs (local eval artifacts, not source)
+/gdpval-*.json
+/stirrup-metrics-smoke-results.json
+/test_output.txt
+/artifacts/
+
+# Local pricing snapshot (kept in ~/.rllm, not source)
+rllm/data/gdpval_aa/*_pricing_*.json
