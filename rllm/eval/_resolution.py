@@ -30,7 +30,6 @@ from typing import Any
 
 import tomllib
 
-from rllm.env import env_int
 from rllm.eval.module_evaluator import PythonModuleEvaluator, _coerce_eval_result
 from rllm.eval.script_evaluator import ShellScriptEvaluator
 from rllm.eval.types import EvalOutput
@@ -320,12 +319,8 @@ def _replay_dockerfile(task: Task, sandbox: Sandbox, backend: str) -> None:
         return
     if not _should_replay_dockerfile(task):
         return
-    # Images that install a large pinned package closure need longer than the
-    # default bound. A step that exceeds it is swallowed by _safe_exec, so
-    # without room to finish the sandbox comes up quietly half-built.
-    timeout = float(env_int("RLLM_DOCKERFILE_REPLAY_TIMEOUT_S", 900))
     for cmd in _dockerfile_run_commands(task):
-        _safe_exec(sandbox, cmd, timeout=timeout)
+        _safe_exec(sandbox, cmd, timeout=900)
 
 
 def _task_dockerfile(task: Task) -> Path | None:

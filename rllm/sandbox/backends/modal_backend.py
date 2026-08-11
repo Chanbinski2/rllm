@@ -609,15 +609,14 @@ def build_modal_snapshot(task, key: str, prior_ref: str | None = None, *, force:
         return prior_ref
 
     # Size the build sandbox's lifetime to the worst-case replay: each RUN is
-    # bounded by the replay timeout (a step that hangs against a prebuilt image
-    # burns its full bound), plus the install bound, the snapshot capture, and
-    # pull slack — floored at the rollout default. Without this floor, two hung
-    # steps killed the sandbox mid-build; without the capture budget the
-    # sandbox can expire during the snapshot, which is the thing being captured.
+    # bounded at 900s (a step that hangs against a prebuilt image burns its full
+    # bound), plus the install bound, the snapshot capture, and pull slack —
+    # floored at the rollout default. Without this floor, two hung steps killed
+    # the sandbox mid-build; without the capture budget the sandbox can expire
+    # during the snapshot, which is the thing being captured.
     install_budget = env_int("RLLM_HARNESS_INSTALL_TIMEOUT_S", 900) if install_script else 0
     n_replay = len(_dockerfile_run_commands(task)) if _should_replay_dockerfile(task) else 0
-    replay_budget = env_int("RLLM_DOCKERFILE_REPLAY_TIMEOUT_S", 900) * n_replay
-    build_timeout = max(_default_sandbox_timeout(), replay_budget + install_budget + _SNAPSHOT_TIMEOUT + 600)
+    build_timeout = max(_default_sandbox_timeout(), 900 * n_replay + install_budget + _SNAPSHOT_TIMEOUT + 600)
     sb = _create_base_sandbox(task, "modal", name=f"{key}-build", timeout=build_timeout)
     try:
         _replay_dockerfile(task, sb, "modal")

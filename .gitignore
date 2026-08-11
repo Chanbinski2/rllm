@@ -233,5 +233,3 @@ gcp-key.json
 /test_output.txt
 /artifacts/
 
-# Local pricing snapshot (kept in ~/.rllm, not source)
-rllm/data/gdpval_aa/*_pricing_*.json
