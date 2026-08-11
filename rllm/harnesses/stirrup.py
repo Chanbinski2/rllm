@@ -31,8 +31,12 @@ import logging
 import os
 import re
 import shlex
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 from rllm import paths
 from rllm.data import gdpval_aa
@@ -118,6 +122,22 @@ class StirrupHarness(BaseCliHarness):
     # provider rejects the image content block mid-trajectory.
     enable_vision: bool = env_int("RLLM_STIRRUP_ENABLE_VISION", 1) == 1
 
+    @property
+    def run_id(self) -> str:
+        """Identifier for one ``rllm eval`` invocation.
+
+        ``AgentConfig`` carries no run-scoped id — ``session_uid`` is per task —
+        and the flow instance is built once per run, so mint it here and reuse
+        it for every task. ``RLLM_ARENA_RUN_ID`` pins it for a resumed run that
+        should land in the same directory.
+        """
+        cached = getattr(self, "_run_id", None)
+        if cached is None:
+            pinned = os.environ.get("RLLM_ARENA_RUN_ID")
+            cached = _slug(pinned, "run") if pinned else f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+            self._run_id = cached
+        return cached
+
     def install_script(self) -> str:
         return _INSTALL_SCRIPT
 
@@ -184,17 +204,49 @@ class StirrupHarness(BaseCliHarness):
         self._exec_agent(sandbox, f"chmod -R a+rX {shlex.quote(_CONFIG_DIR)}", env=env_vars)
 
         timeout = float(task.metadata.get("agent_timeout", self.run_timeout))
+        driver_output = ""
         try:
-            self._exec_agent(sandbox, self.build_invocation("", task, config), timeout=timeout, env=env_vars, user=agent_user)
+            driver_output = self._exec_agent(sandbox, self.build_invocation("", task, config), timeout=timeout, env=env_vars, user=agent_user)
         except Exception as e:
             # The submission bundle and run metadata may still exist (e.g. the
             # driver finished but the tee pipe failed), so keep collecting.
             logger.warning("%s execution failed: %s", type(self).__name__, e)
 
         run_data = self._read_run_data(sandbox)
-        metrics = _usage_metrics(run_data, config.model)
+        # A failed task otherwise surfaces only as a bare "EmptyCompletion" in
+        # the eval summary, with the reason left behind in the torn-down sandbox
+        # or buried in a manifest nobody reads mid-sweep.
+        termination = run_data.get("termination") or {}
+        if termination.get("type") == "error":
+            # The driver caught this one and recorded it, so the log is enough.
+            logger.warning("Stirrup run for task %s failed: %s", task.id, termination.get("reason"))
+        elif not run_data:
+            # No metadata at all means the driver never reached its epilogue,
+            # and its output is the only account of why.
+            self._log_driver_failure(sandbox, task, driver_output)
+        metrics = _usage_metrics(run_data)
         artifacts = self._collect_submission(sandbox, task, config, run_data, metrics)
         return Episode(task=task.metadata, trajectories=[Trajectory(name=self.name, steps=[])], metrics=metrics, artifacts=artifacts)
+
+    def _log_driver_failure(self, sandbox: Sandbox, task: Task, driver_output: str) -> None:
+        """Log the tail of the driver's output for a task that produced nothing.
+
+        Prefers the in-sandbox log over the captured stdout: a timeout or a
+        broken pipe truncates what ``_exec_agent`` returns, while ``tee`` has
+        already written whatever the driver managed to print.
+        """
+        tail = ""
+        try:
+            tail = sandbox.exec(f"tail -c 4000 {shlex.quote(self.stdout_log_path)}", user="root") or ""
+        except Exception:
+            logger.debug("No driver log at %s", self.stdout_log_path, exc_info=True)
+        if not tail.strip():
+            tail = driver_output[-4000:]
+        logger.warning(
+            "Stirrup produced no run metadata for task %s; driver log tail:\n%s",
+            task.id,
+            tail.strip() or "(empty)",
+        )
 
     @staticmethod
     def _read_run_data(sandbox: Sandbox) -> dict[str, Any]:
@@ -219,10 +271,8 @@ class StirrupHarness(BaseCliHarness):
         Runs before the sandbox is torn down. The bundle is staged in-sandbox
         by the driver, so this is a single directory download regardless of
         where the solver actually wrote its files.
-
         """
-        safe_uid = re.sub(r"[^A-Za-z0-9_.-]+", "_", config.session_uid).strip("._") or "run"
-        local_dir = Path(paths.rllm_path("agent_outputs", safe_uid))
+        local_dir = _submission_dir(task, config, self.name, self.run_id)
 
         downloaded: list[str] = []
         download = getattr(sandbox, "download_dir", None)
@@ -304,6 +354,65 @@ class StirrupHarness(BaseCliHarness):
         return manifest
 
 
+def _slug(value: str, fallback: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._") or fallback
+
+
+def _benchmark_name(dataset_dir: Path) -> str:
+    """Benchmark name from ``dataset.toml``, else the directory name.
+
+    Prefer the declared name: a dataset materialized to ``/tmp/gdpval-smoke``
+    should still file its submissions under ``gdpval``.
+    """
+    config = Path(dataset_dir) / "dataset.toml"
+    if config.exists():
+        try:
+            name = tomllib.loads(config.read_text()).get("dataset", {}).get("name")
+            if name:
+                return _slug(name, "benchmark")
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    return _slug(Path(dataset_dir).name, "benchmark")
+
+
+def _player_id(model: str, agent: str) -> str:
+    """Directory-safe competitor identity.
+
+    Identity is (model, agent, label): the same model behind a different
+    scaffold is a different competitor, and ``RLLM_ARENA_PLAYER_LABEL``
+    separates runs of the same pair that should rank independently (different
+    sampling or tool settings). Without the label they pool into one player and
+    the configurations can never be compared.
+    """
+    parts = [_slug(model, "model"), _slug(agent, "agent")]
+    label = os.environ.get("RLLM_ARENA_PLAYER_LABEL")
+    return "__".join(parts) + (f"@{_slug(label, 'run')}" if label else "")
+
+
+def _submission_dir(task: Task, config: AgentConfig, agent: str, run_id: str) -> Path:
+    """Where this task's submission is preserved.
+
+    Keyed by benchmark, player and run so a second model — or a second run of
+    the same model — accumulates alongside the first instead of replacing it.
+    The previous scheme keyed on ``session_uid`` alone (``<task>:<attempt>``),
+    which silently destroyed the earlier model's files and left its episode
+    JSON pointing at the newer model's output.
+    """
+    attempt = 0
+    _, _, tail = str(config.session_uid).rpartition(":")
+    if tail.isdigit():
+        attempt = int(tail)
+    return Path(
+        paths.rllm_path(
+            "agent_outputs",
+            _benchmark_name(task.dataset_dir),
+            _player_id(config.model, agent),
+            run_id,
+            f"{_slug(str(task.id), 'task')}__{attempt}",
+        )
+    )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -328,7 +437,14 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _usage_metrics(run_data: dict[str, Any], model: str) -> dict[str, Any]:
+def _usage_metrics(run_data: dict[str, Any]) -> dict[str, Any]:
+    """Solver token usage for one rollout.
+
+    Tokens only, deliberately. Cost is a function of vendor rates that change
+    without notice and vary per account, so computing it here would bake a
+    dated snapshot into results that read as authoritative. Multiply these
+    counts by the rates actually in effect instead.
+    """
     metadata = run_data.get("metadata") if isinstance(run_data.get("metadata"), dict) else {}
     raw_usage = metadata.get("token_usage")
     usage_entries = raw_usage if isinstance(raw_usage, list) else [raw_usage]
@@ -345,21 +461,6 @@ def _usage_metrics(run_data: dict[str, Any], model: str) -> dict[str, Any]:
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
-
-    pricing_path = os.environ.get("RLLM_PRICING_FILE") or os.environ.get("GDPVAL_PRICING_FILE")
-    if pricing_path:
-        try:
-            pricing = json.loads(Path(pricing_path).expanduser().read_text(encoding="utf-8"))
-            models = pricing.get("models") if isinstance(pricing, dict) else {}
-            rates = models.get(model) or models.get(model.removeprefix("openrouter/"))
-            if isinstance(rates, dict):
-                metrics["cost_usd"] = (
-                    input_tokens * float(rates.get("input") or 0)
-                    + answer_tokens * float(rates.get("answer") or rates.get("output") or 0)
-                    + reasoning_tokens * float(rates.get("reasoning") or rates.get("answer") or rates.get("output") or 0)
-                ) / 1_000_000
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            pass
     return metrics
 
 

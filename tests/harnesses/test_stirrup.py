@@ -9,7 +9,7 @@ import pytest
 from rllm.data import gdpval_aa as aa
 from rllm.data.gdpval_builder import RUN_METADATA_PATH, SUBMISSION_DIR
 from rllm.eval.agent_loader import load_agent
-from rllm.harnesses.stirrup import _DRIVER_SCRIPT, STIRRUP_VERSION, StirrupHarness, _usage_metrics
+from rllm.harnesses.stirrup import _DRIVER_SCRIPT, STIRRUP_VERSION, StirrupHarness, _benchmark_name, _player_id, _submission_dir, _usage_metrics
 from rllm.types import AgentConfig, Task
 
 
@@ -27,6 +27,16 @@ def _task(tmp_path: Path | None = None) -> Task:
         task.dataset_dir = tmp_path
         task.sub_dir = None
     return task
+
+
+def _config_for(model: str, **sampling_params) -> AgentConfig:
+    return AgentConfig(
+        base_url="http://gateway/sessions/test/v1",
+        model=model,
+        session_uid="gdpval-1:0",
+        sampling_params=sampling_params,
+        metadata={"gateway_auth_token": "gateway-token"},
+    )
 
 
 def _config(**sampling_params) -> AgentConfig:
@@ -279,7 +289,11 @@ def test_run_preserves_the_submission_and_writes_a_manifest(tmp_path, monkeypatc
     task = _task(tmp_path)
     episode = StirrupHarness().run(task, _config(), env=sandbox)
 
-    assert sandbox.downloads == [(SUBMISSION_DIR, str(tmp_path / "rllm-home" / "agent_outputs" / "test"))]
+    remote, local = sandbox.downloads[0]
+    assert remote == SUBMISSION_DIR
+    # Keyed benchmark / player / run / task__attempt.
+    assert Path(local).name == "gdpval-1__0"
+    assert Path(local).parent.parent.name == _player_id("z-ai/glm-5.2", "stirrup")
     assert episode.metrics["turns"] == 12
     assert episode.metrics["total_tokens"] == 15
 
@@ -353,14 +367,15 @@ def test_a_run_that_produced_nothing_is_still_recorded(tmp_path, monkeypatch):
     assert episode.artifacts["submission_dir"] is None
 
 
-def test_usage_metrics_include_turns_tokens_and_priced_cost(tmp_path, monkeypatch):
-    pricing = tmp_path / "pricing.json"
-    pricing.write_text(json.dumps({"models": {"z-ai/glm-5.2": {"input": 1.4, "answer": 4.4, "reasoning": 4.4}}}))
-    monkeypatch.setenv("RLLM_PRICING_FILE", str(pricing))
+def test_usage_metrics_report_turns_and_tokens_only():
+    """Tokens, never cost.
 
+    Vendor rates change without notice and differ per account, so pricing here
+    would freeze a dated rate into every saved result and make it read as
+    authoritative long after it stopped being true.
+    """
     metrics = _usage_metrics(
         {"turns": 7, "metadata": {"token_usage": [{"input": 1_000_000, "answer": 100_000, "reasoning": 50_000}]}},
-        "z-ai/glm-5.2",
     )
 
     assert metrics == {
@@ -370,7 +385,6 @@ def test_usage_metrics_include_turns_tokens_and_priced_cost(tmp_path, monkeypatc
         "reasoning_tokens": 50_000,
         "output_tokens": 150_000,
         "total_tokens": 1_150_000,
-        "cost_usd": pytest.approx(2.06),
     }
 
 
@@ -442,3 +456,51 @@ def test_staging_reports_rejected_paths_instead_of_dropping_them(driver, tmp_pat
 
     assert [entry["submitted_path"] for entry in artifacts] == [str(work / "report.docx")]
     assert {entry["path"] for entry in rejected} == {"/etc/passwd", "relative.docx"}
+
+
+def test_a_second_model_does_not_overwrite_the_first(tmp_path, monkeypatch):
+    """The corpus must accumulate competitors, not replace them.
+
+    Keying on session_uid alone (``<task>:<attempt>``) put every model's files
+    in one directory: running kimi after glm deleted glm's deliverables and
+    left glm's episode JSON pointing at kimi's output.
+    """
+    monkeypatch.setenv("RLLM_HOME", str(tmp_path / "rllm-home"))
+    task = _task(tmp_path)
+
+    glm = _submission_dir(task, _config(), "stirrup", "run-1")
+    kimi = _submission_dir(task, _config_for("moonshotai/kimi-k3"), "stirrup", "run-1")
+    assert glm != kimi
+
+    # A different scaffold is a different competitor, too.
+    assert _submission_dir(task, _config(), "terminus2", "run-1") != glm
+    # And two runs of the same player stay separate rather than clobbering.
+    assert _submission_dir(task, _config(), "stirrup", "run-2") != glm
+
+    # Same player, same run, different task/attempt still separate.
+    other = Task(id="gdpval-2", instruction="", metadata=dict(task.metadata))
+    other.dataset_dir = tmp_path
+    assert _submission_dir(other, _config(), "stirrup", "run-1") != glm
+
+
+def test_player_label_separates_configurations_of_one_model(tmp_path, monkeypatch):
+    """Without a label, a re-run pools into the original and the two settings
+    can never be ranked against each other."""
+    monkeypatch.setenv("RLLM_HOME", str(tmp_path / "rllm-home"))
+    task = _task(tmp_path)
+    plain = _submission_dir(task, _config(), "stirrup", "run-1")
+
+    monkeypatch.setenv("RLLM_ARENA_PLAYER_LABEL", "vision-off")
+    labelled = _submission_dir(task, _config(), "stirrup", "run-1")
+
+    assert plain != labelled
+    assert "vision-off" in str(labelled)
+
+
+def test_benchmark_name_prefers_the_declared_dataset_name(tmp_path):
+    """A dataset materialized to /tmp/gdpval-smoke still files under gdpval."""
+    (tmp_path / "dataset.toml").write_text('[dataset]\nname = "gdpval"\n')
+    task = _task(tmp_path)
+
+    assert _benchmark_name(task.dataset_dir) == "gdpval"
+    assert "gdpval" in str(_submission_dir(task, _config(), "stirrup", "run-1"))
