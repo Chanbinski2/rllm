@@ -16,6 +16,13 @@ import pytest
 from rllm.eval.reward_fns import gdpval_rubric as rubric
 from rllm.types import Episode, Task
 
+
+@pytest.fixture(autouse=True)
+def _isolate_judge_env(monkeypatch):
+    monkeypatch.setenv("GDPVAL_JUDGE_VISION_ATTEMPTS", "1")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+
+
 RUBRIC = json.dumps(
     [
         {"score": 2, "criterion": "The deliverable is an Excel workbook.", "rubric_item_id": "a"},
@@ -167,7 +174,7 @@ def test_no_judge_configured_is_ungraded(tmp_path, monkeypatch):
     """A missing judge is a harness problem, and must not read as a model failure."""
     xlsx = tmp_path / "Sample.xlsx"
     xlsx.write_text("not really a workbook")
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: (None, None, None))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setattr(rubric, "_find_deliverable_view", lambda task, ep: rubric.DeliverableView("some text", [], "file:Sample.xlsx"))
 
     out = rubric.evaluate_rubric(_task(), Episode(artifacts={"submission_manifest": str(_manifest(tmp_path, "finish"))}))
@@ -183,7 +190,6 @@ def test_no_judge_configured_is_ungraded(tmp_path, monkeypatch):
 def test_grades_a_deliverable_and_writes_an_audit_trail(tmp_path, monkeypatch):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: ("stub-judge", None, None))
     monkeypatch.setattr(rubric, "_find_deliverable_view", lambda task, ep: rubric.DeliverableView("workbook text", [], "file:Sample.xlsx"))
     monkeypatch.setattr(rubric, "_find_input_view", lambda task: rubric.DeliverableView("", [], "none"))
     # First two criteria met, the penalty criterion not triggered.
@@ -203,7 +209,7 @@ def test_grades_a_deliverable_and_writes_an_audit_trail(tmp_path, monkeypatch):
 
     decisions = json.loads((corpus / "judge_decisions.json").read_text())
     assert decisions["task_id"] == "task-1"
-    assert decisions["judge_model"] == "stub-judge"
+    assert decisions["judge_model"] == rubric._GEMINI_JUDGE_MODEL
     assert [c["met"] for c in decisions["criteria"]] == [True, True, False]
 
 
@@ -268,7 +274,6 @@ def test_an_unreadable_deliverable_is_ungraded_not_scored_near_zero(tmp_path, mo
     """The failure that matters: handed an error string, a judge answers "No" to
     every content criterion and the run scores a plausible ~0.03 that looks like
     a bad deliverable instead of a broken grader."""
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: ("stub-judge", None, None))
     monkeypatch.setattr(
         rubric,
         "_find_deliverable_view",
@@ -292,7 +297,6 @@ def test_an_unreadable_deliverable_is_ungraded_not_scored_near_zero(tmp_path, mo
 
 def test_rendered_page_images_keep_an_unparsed_deliverable_gradable(tmp_path, monkeypatch):
     """Text extraction can fail while the page images still show the document."""
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: ("stub-judge", None, None))
     monkeypatch.setattr(
         rubric,
         "_find_deliverable_view",
@@ -314,7 +318,31 @@ def test_the_renderer_uses_the_published_gdpval_image():
     assert rubric._render_docker_image() == gdpval_aa.published_image_ref()
 
 
-def test_office_conversion_runs_only_in_the_pinned_container(tmp_path, monkeypatch):
+def test_office_conversion_prefers_host_soffice(tmp_path, monkeypatch):
+    import subprocess
+
+    source = tmp_path / "report.xlsx"
+    source.write_bytes(b"workbook")
+    soffice = tmp_path / "soffice"
+    soffice.write_text("#!/bin/sh\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        out_dir = Path(command[command.index("--outdir") + 1])
+        (out_dir / "report.pdf").write_bytes(b"pdf")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setenv("GDPVAL_SOFFICE", str(soffice))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert rubric._soffice_convert(source, "pdf") == b"pdf"
+    assert calls[0][0] == str(soffice)
+    assert "--headless" in calls[0]
+    assert any(arg.startswith("-env:UserInstallation=file://") for arg in calls[0])
+
+
+def test_office_conversion_falls_back_to_docker_without_host_soffice(tmp_path, monkeypatch):
     import subprocess
 
     from rllm.data.gdpval_aa import AA_PLATFORM
@@ -330,6 +358,8 @@ def test_office_conversion_runs_only_in_the_pinned_container(tmp_path, monkeypat
         (Path(output_dir) / "report.pdf").write_bytes(b"pdf")
         return subprocess.CompletedProcess(command, 0)
 
+    monkeypatch.delenv("GDPVAL_SOFFICE", raising=False)
+    monkeypatch.setattr(rubric, "_soffice_bin", lambda: None)
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert rubric._soffice_convert(source, "pdf") == b"pdf"
@@ -340,6 +370,32 @@ def test_office_conversion_runs_only_in_the_pinned_container(tmp_path, monkeypat
     assert f"type=bind,source={tmp_path},target=/input,readonly" in command
     assert command[-1] == "/input/report.xlsx"
     assert kwargs == {"check": True, "capture_output": True, "timeout": 180}
+
+
+def test_office_conversion_falls_back_to_docker_when_host_fails(tmp_path, monkeypatch):
+    import subprocess
+
+    source = tmp_path / "report.xlsx"
+    source.write_bytes(b"workbook")
+    soffice = tmp_path / "soffice"
+    soffice.write_text("#!/bin/sh\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[0] == str(soffice):
+            raise subprocess.CalledProcessError(1, command)
+        output_mount = next(arg for arg in command if arg.startswith("type=bind,source=") and arg.endswith(",target=/output"))
+        output_dir = output_mount.removeprefix("type=bind,source=").removesuffix(",target=/output")
+        (Path(output_dir) / "report.pdf").write_bytes(b"pdf")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setenv("GDPVAL_SOFFICE", str(soffice))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert rubric._soffice_convert(source, "pdf") == b"pdf"
+    assert calls[0][0] == str(soffice)
+    assert calls[1][:2] == ["docker", "run"]
 
 
 # --------------------------------------------------------------------------- #
@@ -449,7 +505,6 @@ def test_a_non_vision_judge_is_reported_as_text_only(tmp_path, monkeypatch):
     text. Reporting the *prepared* image count then claims the page renderings
     were graded when every visual criterion was decided from text alone.
     """
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: ("stub-judge", None, None))
     monkeypatch.setattr(rubric, "_find_deliverable_view", lambda task, ep: rubric.DeliverableView("workbook text", ["data:image/jpeg;base64,AAA"] * 3, "file:Sample.xlsx"))
     monkeypatch.setattr(rubric, "_find_input_view", lambda task: rubric.DeliverableView("", [], "none"))
     monkeypatch.setattr(rubric, "_grade_rubric_multimodal", lambda *a, **k: ([True, False, False], ["ok", "no", "no"]))
@@ -472,7 +527,6 @@ def test_a_non_vision_judge_is_reported_as_text_only(tmp_path, monkeypatch):
 
 
 def test_a_vision_judge_reports_the_images_it_consumed(tmp_path, monkeypatch):
-    monkeypatch.setattr(rubric, "_resolve_judge", lambda task: ("stub-judge", None, None))
     monkeypatch.setattr(rubric, "_find_deliverable_view", lambda task, ep: rubric.DeliverableView("workbook text", ["data:image/jpeg;base64,AAA"] * 3, "file:Sample.xlsx"))
     monkeypatch.setattr(rubric, "_find_input_view", lambda task: rubric.DeliverableView("", [], "none"))
     monkeypatch.setattr(rubric, "_grade_rubric_multimodal", lambda *a, **k: ([True, False, False], ["ok", "no", "no"]))
@@ -701,3 +755,4 @@ def test_a_conversion_that_loses_content_does_not_win(tmp_path, monkeypatch):
 
     text = rubric._extract_xlsx(source)
     assert "Population" in text
+

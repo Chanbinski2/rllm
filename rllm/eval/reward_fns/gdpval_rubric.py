@@ -44,10 +44,13 @@ which watches them natively — see :mod:`rllm.eval.reward_fns._gdpval_media`. T
 path needs a direct ``GEMINI_API_KEY``; without one those tasks are reported
 ungraded rather than scored from a filename.
 
-Judge model resolution (first hit wins), mirroring ``claw_eval``:
-  1. ``GDPVAL_JUDGE_MODEL`` / ``GDPVAL_JUDGE_BASE_URL`` / ``GDPVAL_JUDGE_API_KEY``.
-  2. ``task.metadata`` keys ``judge_model`` / ``judge_base_url`` / ``judge_api_key``.
-  3. The user's rLLM provider config (``~/.rllm/config.json``) via litellm.
+Document deliverables use the same pinned Gemini 3.1 Pro judge
+(``gemini/gemini-3.1-pro-preview``). There is no multi-judge panel. The key is
+``GEMINI_API_KEY`` (same direct Google key as the media judge).
+
+A transient TLS error on an image payload takes the same path as "this judge
+has no vision". Retry the multimodal call (``GDPVAL_JUDGE_VISION_ATTEMPTS``,
+default 3) rather than silently accepting a text-only grade.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -572,14 +576,77 @@ def _encode_raw_image(raw: bytes, ext: str) -> str:
         return f"data:image/{mime};base64," + base64.b64encode(raw).decode("ascii")
 
 
-def _soffice_convert(p: Path, target_ext: str) -> bytes | None:
-    """Convert with LibreOffice from the pinned GDPval Docker image.
+def _soffice_bin() -> str | None:
+    """Host LibreOffice, if any.
 
-    The input directory is mounted read-only and a temporary output directory
-    is mounted writable. Pinning the complete image (rather than discovering a
-    host LibreOffice binary) keeps LibreOffice, fonts, and system libraries the
-    same on every evaluator. Returns ``None`` when Docker or conversion fails.
+    ``GDPVAL_SOFFICE`` pins a binary (the Together node uses the 25.2.3 tree
+    matching AA's ``libreoffice-core=4:25.2.3-2+deb13u4``). Otherwise ``soffice``
+    / ``libreoffice`` on PATH. Docker is the fallback when this returns None.
     """
+    pinned = os.environ.get("GDPVAL_SOFFICE")
+    if pinned:
+        return pinned
+    import shutil
+
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def _soffice_empty_output_warning(result, target_ext: str, name: str) -> None:
+    streams = b"\n".join(s for s in (result.stderr, result.stdout) if s)
+    detail = [ln for ln in streams.decode("utf-8", errors="replace").splitlines() if ln.strip() and "javaldx" not in ln]
+    logger.warning(
+        "[gdpval] LibreOffice produced no %s for %s (exit 0, no output file): %s",
+        target_ext,
+        name,
+        detail[-1] if detail else "no diagnostic output",
+    )
+
+
+def _soffice_convert_host(soffice: str, p: Path, target_ext: str) -> bytes | None:
+    """Convert with a host LibreOffice binary.
+
+    Each call gets its own ``UserInstallation`` so concurrent judges do not
+    serialize on ``~/.config/libreoffice``.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td)
+        out = out_dir / f"{p.stem}.{target_ext}"
+        profile = out_dir / "lo-profile"
+        src_file = p.resolve()
+        env = {**os.environ, "SAL_USE_VCLPLUGIN": "svp"}
+        try:
+            result = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--norestore",
+                    "--nolockcheck",
+                    f"-env:UserInstallation=file://{profile}",
+                    "--convert-to",
+                    target_ext,
+                    "--outdir",
+                    str(out_dir),
+                    str(src_file),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=180,
+                env=env,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.warning("[gdpval] host LibreOffice conversion failed for %s -> %s: %s", p.name, target_ext, e)
+            return None
+        if out.exists():
+            return out.read_bytes()
+        _soffice_empty_output_warning(result, target_ext, p.name)
+        return None
+
+
+def _soffice_convert_docker(p: Path, target_ext: str) -> bytes | None:
+    """Convert with LibreOffice from the pinned GDPval Docker image."""
     import subprocess
     import tempfile
 
@@ -617,25 +684,27 @@ def _soffice_convert(p: Path, target_ext: str) -> bytes | None:
             )
             if out.exists():
                 return out.read_bytes()
-            # LibreOffice exits 0 even when it refuses the document ("Error:
-            # source file could not be loaded" on stdout), so ``check=True``
-            # never fires and the missing output file is the only evidence.
-            # Several upstream GDPval DOCX are damaged this way: python-docx
-            # still reads their text, so the judge gets prose but no page
-            # images — a silent downgrade unless it is said out loud here.
-            # The reason lands on stderr ("Error: source file could not be
-            # loaded"); stdout carries the javaldx noise. Read both.
-            streams = b"\n".join(s for s in (result.stderr, result.stdout) if s)
-            detail = [ln for ln in streams.decode("utf-8", errors="replace").splitlines() if ln.strip() and "javaldx" not in ln]
-            logger.warning(
-                "[gdpval] LibreOffice produced no %s for %s (exit 0, no output file): %s",
-                target_ext,
-                p.name,
-                detail[-1] if detail else "no diagnostic output",
-            )
+            _soffice_empty_output_warning(result, target_ext, p.name)
         except (subprocess.SubprocessError, OSError) as e:
             logger.warning("[gdpval] Docker LibreOffice conversion failed for %s -> %s: %s", p.name, target_ext, e)
         return None
+
+
+def _soffice_convert(p: Path, target_ext: str) -> bytes | None:
+    """Office -> PDF/xlsx via host LibreOffice, else the pinned Docker image.
+
+    Try a local ``soffice`` first (``GDPVAL_SOFFICE`` or PATH). If none is
+    available or the host conversion fails, fall back to Docker. Returns
+    ``None`` when both paths fail — the deliverable is then judged on text
+    alone.
+    """
+    host = _soffice_bin()
+    if host:
+        converted = _soffice_convert_host(host, p, target_ext)
+        if converted is not None:
+            return converted
+        logger.warning("[gdpval] host LibreOffice produced no %s for %s; falling back to Docker", target_ext, p.name)
+    return _soffice_convert_docker(p, target_ext)
 
 
 def _office_to_pdf(p: Path) -> bytes | None:
@@ -922,32 +991,6 @@ def _find_input_view(task: Task) -> DeliverableView:
     return DeliverableView("\n\n".join(sections), images, "file:" + ",".join(names))
 
 
-def _resolve_judge(task: Task) -> tuple[str, str | None, str | None]:
-    """Return (model, base_url, api_key); mirrors claw_eval's resolution."""
-    env_model = os.environ.get("GDPVAL_JUDGE_MODEL")
-    if env_model:
-        return env_model, os.environ.get("GDPVAL_JUDGE_BASE_URL"), os.environ.get("GDPVAL_JUDGE_API_KEY")
-
-    meta_model = task.metadata.get("judge_model")
-    if meta_model:
-        return meta_model, task.metadata.get("judge_base_url"), task.metadata.get("judge_api_key")
-
-    try:
-        from rllm.eval.config import get_provider_info, load_config
-
-        cfg = load_config()
-        if cfg.provider == "custom":
-            return cfg.model, cfg.base_url or None, cfg.api_key or "EMPTY"
-        info = get_provider_info(cfg.provider)
-        if info and cfg.model:
-            prefix = info.litellm_prefix
-            model = f"{prefix}/{cfg.model}" if prefix and not cfg.model.startswith(prefix + "/") else cfg.model
-            return model, None, cfg.api_key or None
-    except Exception:
-        logger.debug("[gdpval] could not resolve judge from rLLM config", exc_info=True)
-    return "", None, None
-
-
 def _make_rubric_judge(model: str, base_url: str | None, api_key: str | None):
     """Return ``call(messages) -> text`` for the multimodal rubric judge.
 
@@ -979,6 +1022,84 @@ def _make_rubric_judge(model: str, base_url: str | None, api_key: str | None):
 
     call.text_only_fallbacks = 0
     return call
+
+
+_GEMINI_JUDGE_MODEL = "gemini/gemini-3.1-pro-preview"
+
+
+@dataclass
+class _JudgeRun:
+    """One Gemini rubric grade (vision retries already applied)."""
+
+    name: str
+    signal: str
+    model: str
+    result: GradeResult
+    met: list[bool]
+    justifications: list[str]
+    fell_back: bool
+    attempt: int
+
+
+def _vision_attempts() -> int:
+    """Retries when a multimodal call falls back to text-only (TLS vs no-vision)."""
+    return max(1, env_int("GDPVAL_JUDGE_VISION_ATTEMPTS", 3))
+
+
+def _criteria_audit(criteria: list[Criterion], met: list[bool], justifications: list[str]) -> list[dict]:
+    return [
+        {"score": c.score, "criterion": c.text, "met": bool(m), "justification": j}
+        for c, m, j in zip(criteria, met, justifications, strict=False)
+    ]
+
+
+def _run_one_judge(
+    name: str,
+    signal: str,
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+    criteria: list[Criterion],
+    view: DeliverableView,
+    prompt: str,
+    input_view: DeliverableView,
+) -> _JudgeRun:
+    """Grade with ``model``, retrying when the call silently drops to text-only."""
+    attempts = _vision_attempts()
+    last: _JudgeRun | None = None
+    for attempt in range(1, attempts + 1):
+        judge_call = _make_rubric_judge(model, base_url, api_key)
+        met, justifications = _grade_rubric_multimodal(
+            criteria,
+            view,
+            prompt,
+            judge_call,
+            input_view.text,
+            input_view.images,
+        )
+        met = _verify_rubric(criteria, met, justifications, judge_call)
+        last = _JudgeRun(
+            name=name,
+            signal=signal,
+            model=model,
+            result=aggregate(criteria, met),
+            met=met,
+            justifications=justifications,
+            fell_back=getattr(judge_call, "text_only_fallbacks", 0) > 0,
+            attempt=attempt,
+        )
+        if not last.fell_back:
+            return last
+        if attempt < attempts:
+            logger.warning(
+                "[gdpval] %s judge text-only fallback (attempt %d/%d); retrying with a fresh client",
+                name,
+                attempt,
+                attempts,
+            )
+            time.sleep(2 * attempt)
+    assert last is not None
+    return last
 
 
 def _rubric_lines(chunk: list[tuple[int, Criterion]]) -> str:
@@ -1284,29 +1405,53 @@ def evaluate_rubric(task: Task, episode: Episode) -> EvalOutput:
             },
         )
     prompt = task.metadata.get("prompt") or (task.instruction if isinstance(task.instruction, str) else "") or ""
+    input_view = _find_input_view(task)
 
     if view.media:
-        # Audio/video deliverable: grade natively via Gemini, or not at all.
-        judge_call, model, ungraded_reason = _prepare_media_judge(view.media, max_tokens=_rubric_max_tokens())
-        if ungraded_reason:
-            return EvalOutput(
-                reward=0.0,
-                is_correct=False,
-                signals=[Signal(name="rubric_score", value=0.0), Signal(name="ungraded_media", value=1.0), Signal(name="ungraded", value=1.0), *structural],
-                metadata={"reason": ungraded_reason, "ungraded": True, "media_files": [Path(m).name for m in view.media]},
-            )
-    else:
-        model, base_url, api_key = _resolve_judge(task)
-        if not model:
-            return EvalOutput(
-                reward=0.0,
-                is_correct=False,
-                signals=[Signal(name="rubric_score", value=0.0), Signal(name="ungraded", value=1.0), *structural],
-                metadata={"reason": "no_judge_configured", "ungraded": True},
-            )
-        judge_call = _make_rubric_judge(model, base_url, api_key)
+        return _evaluate_media_rubric(task, episode, criteria, view, prompt, input_view, structural)
 
-    input_view = _find_input_view(task)
+    key = media_api_key()
+    if not key:
+        logger.warning("[gdpval] GEMINI_API_KEY unset — document task will be ungraded")
+        return EvalOutput(
+            reward=0.0,
+            is_correct=False,
+            signals=[Signal(name="rubric_score", value=0.0), Signal(name="ungraded", value=1.0), *structural],
+            metadata={"reason": "no_judge_configured", "ungraded": True},
+        )
+    try:
+        run = _run_one_judge(
+            "gemini", "gemini", _GEMINI_JUDGE_MODEL, None, key, criteria, view, prompt, input_view
+        )
+    except Exception as e:  # noqa: BLE001 — fail closed rather than invent a score
+        logger.warning("[gdpval] Gemini judge failed: %s", e)
+        return EvalOutput(
+            reward=0.0,
+            is_correct=False,
+            signals=[Signal(name="rubric_score", value=0.0), Signal(name="ungraded", value=1.0), *structural],
+            metadata={"reason": "judge_failed", "ungraded": True},
+        )
+    return _eval_output_from_runs(task, episode, view, input_view, criteria, run, structural)
+
+
+def _evaluate_media_rubric(
+    task: Task,
+    episode: Episode,
+    criteria: list[Criterion],
+    view: DeliverableView,
+    prompt: str,
+    input_view: DeliverableView,
+    structural: list[Signal],
+) -> EvalOutput:
+    """Grade audio/video via Gemini's Files API, or not at all."""
+    judge_call, model, ungraded_reason = _prepare_media_judge(view.media, max_tokens=_rubric_max_tokens())
+    if ungraded_reason:
+        return EvalOutput(
+            reward=0.0,
+            is_correct=False,
+            signals=[Signal(name="rubric_score", value=0.0), Signal(name="ungraded_media", value=1.0), Signal(name="ungraded", value=1.0), *structural],
+            metadata={"reason": ungraded_reason, "ungraded": True, "media_files": [Path(m).name for m in view.media]},
+        )
     met, justifications = _grade_rubric_multimodal(
         criteria,
         view,
@@ -1316,33 +1461,52 @@ def evaluate_rubric(task: Task, episode: Episode) -> EvalOutput:
         input_view.images,
     )
     met = _verify_rubric(criteria, met, justifications, judge_call)
-    result = aggregate(criteria, met)
-    # What the judge actually consumed, not what was prepared for it: a
-    # non-vision judge downgrades to text and every visual criterion is then
-    # decided without seeing the document.
+    run = _JudgeRun(
+        name="gemini",
+        signal="gemini",
+        model=model,
+        result=aggregate(criteria, met),
+        met=met,
+        justifications=justifications,
+        fell_back=getattr(judge_call, "text_only_fallbacks", 0) > 0,
+        attempt=1,
+    )
+    return _eval_output_from_runs(task, episode, view, input_view, criteria, run, structural)
+
+
+def _eval_output_from_runs(
+    task: Task,
+    episode: Episode,
+    view: DeliverableView,
+    input_view: DeliverableView,
+    criteria: list[Criterion],
+    run: _JudgeRun,
+    structural: list[Signal],
+) -> EvalOutput:
+    """Turn a Gemini judge run into the EvalOutput + judge_decisions.json."""
     input_images_prepared = min(len(input_view.images), _max_judge_images())
     images_prepared = min(len(view.images), max(0, _max_judge_images() - input_images_prepared))
     total_images_prepared = input_images_prepared + images_prepared
-    fell_back = getattr(judge_call, "text_only_fallbacks", 0) > 0
+    fell_back = run.fell_back
     images_used = 0 if fell_back else images_prepared
     input_images_used = 0 if fell_back else input_images_prepared
-    _write_judge_decisions(
-        episode,
-        {
-            "task_id": str(task.id),
-            "judge_model": model,
-            "reward": float(result.reward),
-            "earned": result.earned,
-            "total_possible": result.total_possible,
-            "criteria": [{"score": c.score, "criterion": c.text, "met": bool(m), "justification": j} for c, m, j in zip(criteria, met, justifications, strict=False)],
-        },
-    )
+
+    payload = {
+        "task_id": str(task.id),
+        "judge_model": run.model,
+        "reward": float(run.result.reward),
+        "earned": run.result.earned,
+        "total_possible": run.result.total_possible,
+        "criteria": _criteria_audit(criteria, run.met, run.justifications),
+    }
+    _write_judge_decisions(episode, payload)
+
     return EvalOutput(
-        reward=float(result.reward),
-        is_correct=result.reward >= 0.5,
-        signals=[Signal(name="rubric_score", value=float(result.reward)), *structural],
+        reward=float(run.result.reward),
+        is_correct=run.result.reward >= 0.5,
+        signals=[Signal(name="rubric_score", value=float(run.result.reward)), *structural],
         metadata={
-            "judge_model": model,
+            "judge_model": run.model,
             "deliverable_source": view.source,
             "deliverable_images": images_used,
             "deliverable_images_prepared": images_prepared,
@@ -1354,9 +1518,9 @@ def evaluate_rubric(task: Task, episode: Episode) -> EvalOutput:
             "judge_text_only_fallback": fell_back,
             "media_files": [Path(m).name for m in view.media],
             "input_files_included": bool(input_view.text or input_view.images),
-            "earned": result.earned,
-            "total_possible": result.total_possible,
-            "criteria_met": sum(1 for m in met if m),
+            "earned": run.result.earned,
+            "total_possible": run.result.total_possible,
+            "criteria_met": sum(1 for m in run.met if m),
             "criteria_total": len(criteria),
             "occupation": task.metadata.get("occupation", ""),
             "sector": task.metadata.get("sector", ""),

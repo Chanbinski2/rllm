@@ -176,7 +176,7 @@ def test_generated_tasks_carry_no_judge_credentials(tmp_path):
     task_toml = (out / "task-one" / "task.toml").read_text()
 
     assert "[verifier.env]" not in task_toml
-    for name in ["GDPVAL_JUDGE_API_KEY", "GDPVAL_JUDGE_MODEL", "GDPVAL_JUDGE_BASE_URL"]:
+    for name in ["GDPVAL_JUDGE_API_KEY", "GDPVAL_JUDGE_MODEL", "GDPVAL_JUDGE_BASE_URL", "GEMINI_API_KEY", "OPENROUTER_API_KEY"]:
         assert name not in task_toml, name
 
 
