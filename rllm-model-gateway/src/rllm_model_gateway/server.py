@@ -186,6 +186,12 @@ def create_app(
                 config.model,
             )
 
+    heartbeat_interval_s = float(os.environ.get("RLLM_GATEWAY_HEARTBEAT_INTERVAL_S", "25") or "25")
+    if heartbeat_interval_s <= 0:
+        logger.info(
+            "Gateway whitespace heartbeat disabled (RLLM_GATEWAY_HEARTBEAT_INTERVAL_S=%s)",
+            os.environ.get("RLLM_GATEWAY_HEARTBEAT_INTERVAL_S"),
+        )
     proxy = ReverseProxy(
         router=router,
         store=store,
@@ -195,6 +201,7 @@ def create_app(
         cumulative_token_mode=config.cumulative_token_mode,
         renderer=renderer,
         worker_label=str(config.port) if config.port else "",
+        heartbeat_interval_s=heartbeat_interval_s,
     )
     sessions = SessionManager(store)
 
